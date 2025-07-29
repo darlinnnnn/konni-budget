@@ -18,8 +18,8 @@ interface Transaction {
   tanggal: string;
   nominal_transaksi: string;
   deskripsi: string | null;
-  category_id: number | null; // Tambahkan category_id untuk kemudahan update
-  categories: { id: number; name: string } | null; // Kategori bisa jadi null
+  category_id: number | null;
+  categories: { id: number; name: string } | null;
 }
 interface Category {
   id: number;
@@ -89,6 +89,73 @@ function App() {
   const [loadingMore, setLoadingMore] = useState(false);
   const observer = useRef<IntersectionObserver>();
 
+  // --- PERUBAHAN DIMULAI DI SINI: Logika untuk Push Notification ---
+  useEffect(() => {
+    // Kunci VAPID publik Anda. Ganti dengan kunci yang Anda generate.
+    const VAPID_PUBLIC_KEY = "BPcw5eZNx_Zkc0iCDiRnPjfvUS33ypsoWVzwjoi48pMR0j1xydhAJO6W4FTfJ7P583zCgfaK_sw4gXfKkq5MMOQ";
+
+    function urlBase64ToUint8Array(base64String) {
+      const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
+      const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
+      const rawData = window.atob(base64);
+      const outputArray = new Uint8Array(rawData.length);
+      for (let i = 0; i < rawData.length; ++i) {
+        outputArray[i] = rawData.charCodeAt(i);
+      }
+      return outputArray;
+    }
+
+    async function subscribeUserToPush() {
+      try {
+        const registration = await navigator.serviceWorker.ready;
+        const existingSubscription = await registration.pushManager.getSubscription();
+        
+        if (existingSubscription) {
+          console.log("User sudah berlangganan notifikasi.");
+          return;
+        }
+
+        const subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+        });
+
+        console.log("Berhasil berlangganan notifikasi:", subscription);
+
+        // Simpan objek subscription ke database Supabase Anda
+        const { error } = await supabase
+          .from('push_subscriptions')
+          .insert({ subscription_object: subscription });
+
+        if (error) {
+          console.error("Gagal menyimpan subscription:", error);
+        } else {
+          console.log("Subscription berhasil disimpan ke database.");
+        }
+      } catch (error) {
+        console.error("Gagal berlangganan push notification:", error);
+      }
+    }
+
+    if ('serviceWorker' in navigator && 'PushManager' in window) {
+      navigator.serviceWorker.register('/sw.js')
+        .then(swReg => {
+          console.log('Service Worker berhasil didaftarkan:', swReg);
+          // Minta izin setelah service worker siap
+          requestNotificationPermission().then(permission => {
+            if (permission === 'granted') {
+              subscribeUserToPush();
+            }
+          });
+        })
+        .catch(error => {
+          console.error('Gagal mendaftarkan Service Worker:', error);
+        });
+    }
+  }, []);
+  // --- PERUBAHAN SELESAI DI SINI ---
+
+
   const lastTransactionElementRef = useCallback(node => {
     if (loading || loadingMore) return;
     if (observer.current) observer.current.disconnect();
@@ -134,16 +201,11 @@ function App() {
   const requestNotificationPermission = async () => {
     const permission = await Notification.requestPermission();
     setNotificationPermission(permission);
+    return permission; // Kembalikan status izin
   };
 
-  const showNewTransactionNotification = (transaction: any) => {
-    if (notificationPermission !== 'granted') return;
-    const nominal = transaction.nominal_transaksi || '0';
-    const bodyText = `Transaksi baru sebesar ${nominal} telah ditambahkan.`;
-    navigator.serviceWorker.ready.then((registration) => {
-      registration.showNotification('Transaksi Baru!', { body: bodyText, icon: '/logo_192x192.png', vibrate: [200, 100, 200] });
-    });
-  };
+  // Hapus fungsi showNewTransactionNotification karena akan ditangani oleh Service Worker
+  // const showNewTransactionNotification = ...
 
   useEffect(() => { document.documentElement.classList.toggle('dark', theme === 'dark') }, [theme]);
   const toggleTheme = () => setTheme(theme === 'dark' ? 'light' : 'dark');
@@ -333,7 +395,6 @@ function App() {
                   const newRecord = payload.new as Transaction;
                   const newRecordDate = new Date(newRecord.tanggal);
                   if (newRecordDate.getFullYear() === currentMonth.getFullYear() && newRecordDate.getMonth() === currentMonth.getMonth()) {
-                      showNewTransactionNotification(newRecord);
                       const newCategory = categories.find(cat => cat.id === newRecord.category_id);
                       setTransactions(prev => {
                           const isAlreadyPresent = prev.some(trx => trx.id === newRecord.id);
@@ -377,7 +438,7 @@ function App() {
       })
       .subscribe();
     return () => { supabase.removeChannel(channel); };
-  }, [currentMonth, notificationPermission, categories]);
+  }, [currentMonth, categories]);
 
   const formatTanggal = (dateString: string) => new Date(dateString).toLocaleString('id-ID', {
     year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit'
@@ -394,7 +455,6 @@ function App() {
             <h1 className="text-3xl font-bold text-gray-900 dark:text-white">Ringkasan Keuangan</h1>
             <div className="flex items-center gap-2">
                 <button onClick={() => openModal(setIsCategoryModalOpen)} className="p-2 rounded-full text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 transition-all duration-150 active:scale-95" title="Kelola Kategori"><svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-5 5a2 2 0 01-2.828 0l-7-7A2 2 0 013 8V5a2 2 0 012-2z" /></svg></button>
-                {notificationPermission === 'default' && (<button onClick={requestNotificationPermission} className="p-2 rounded-full text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 transition-all duration-150 active:scale-95" title="Izinkan Notifikasi"><svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 17h5l-1.405-1.405A2.032 2.032 0 0118 14.158V11a6.002 6.002 0 00-4-5.659V5a2 2 0 10-4 0v.341C7.67 6.165 6 8.388 6 11v3.159c0 .538-.214 1.055-.595 1.436L4 17h5m6 0v1a3 3 0 11-6 0v-1m6 0H9" /></svg></button>)}
                 {notificationPermission === 'denied' && (<button onClick={() => openModal(setIsNotificationBlockedModalOpen)} className="p-2 rounded-full text-rose-500 dark:text-rose-400 hover:bg-gray-200 dark:hover:bg-gray-700 transition-all duration-150 active:scale-95" title="Notifikasi diblokir. Klik untuk bantuan."><svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" /></svg></button>)}
                 <button onClick={toggleTheme} className="p-2 rounded-full text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700 transition-all duration-150 active:scale-95">{theme === 'dark' ? (<svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" /></svg>) : (<svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z" /></svg>)}</button>
             </div>
@@ -458,7 +518,6 @@ function App() {
 
       {isTransactionModalOpen && (<div className={`fixed inset-0 flex justify-center items-center z-40 transition-opacity duration-300 ${isTransactionModalVisible ? 'bg-black bg-opacity-70' : 'bg-opacity-0'}`} onClick={closeTransactionModal}><div className={`bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-sm border border-gray-200 dark:border-gray-700 transition-all duration-300 ${isTransactionModalVisible ? 'scale-100 opacity-100' : 'scale-95 opacity-0'}`} onClick={(e) => e.stopPropagation()}><h3 className="text-xl font-semibold mb-4">{editingTransaction ? 'Edit Kategori Transaksi' : 'Tambah Transaksi Baru'}</h3><div className="space-y-4">
         
-        {/* --- PERUBAHAN 1: Tampilkan field hanya jika BUKAN mode edit --- */}
         {!editingTransaction && (
           <>
             <div>
@@ -474,7 +533,6 @@ function App() {
         
         <div>
           <label className="text-sm text-gray-500 dark:text-gray-400">Kategori</label>
-          {/* --- PERUBAHAN 2: Percantik Dropdown --- */}
           <div className="relative">
             <select value={selectedCategoryId} onChange={(e) => setSelectedCategoryId(e.target.value)} className="w-full p-2 pr-10 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold appearance-none cursor-pointer">
               <option value="" disabled>Pilih Kategori</option>
