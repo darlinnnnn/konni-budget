@@ -18,6 +18,7 @@ interface Transaction {
   tanggal: string;
   nominal_transaksi: string;
   deskripsi: string | null;
+  category_id: number | null; // Tambahkan category_id untuk kemudahan update
   categories: { id: number; name: string } | null; // Kategori bisa jadi null
 }
 interface Category {
@@ -190,14 +191,24 @@ function App() {
     let error;
 
     if (editingTransaction) {
-        // HANYA UPDATE KATEGORI UNTUK TRANSAKSI YANG ADA
+        const categoryId = parseInt(selectedCategoryId);
         const { error: updateError } = await supabase
             .from('tes')
-            .update({ category_id: parseInt(selectedCategoryId) })
+            .update({ category_id: categoryId })
             .eq('id', editingTransaction.id);
         error = updateError;
+
+        if (!updateError) {
+            const updatedCategory = categories.find(cat => cat.id === categoryId);
+            setTransactions(prevTransactions => 
+                prevTransactions.map(trx => 
+                    trx.id === editingTransaction.id 
+                        ? { ...trx, category_id: categoryId, categories: updatedCategory || null } 
+                        : trx
+                )
+            );
+        }
     } else {
-        // BUAT TRANSAKSI BARU
         if (!newTransactionNominal) {
             alert("Nominal wajib diisi.");
             return;
@@ -220,9 +231,13 @@ function App() {
   
   const handleAddCategory = async () => {
       if (!newCategoryName) return;
-      const { error } = await supabase.from('categories').insert([{ name: newCategoryName }]).select();
-      if (error) alert("Gagal menambah kategori: " + error.message);
-      else setNewCategoryName("");
+      const { data, error } = await supabase.from('categories').insert([{ name: newCategoryName }]).select().single();
+      if (error) {
+        alert("Gagal menambah kategori: " + error.message);
+      } else if (data) {
+        setCategories(prev => [...prev, data].sort((a,b) => a.name.localeCompare(b.name)));
+        setNewCategoryName("");
+      }
   };
   
   const handleDeleteCategory = async (id: number) => {
@@ -233,7 +248,12 @@ function App() {
           return;
       }
       const { error: deleteError } = await supabase.from('categories').delete().eq('id', id);
-      if (deleteError) alert("Gagal menghapus kategori: " + deleteError.message);
+      if (deleteError) {
+        alert("Gagal menghapus kategori: " + deleteError.message);
+      } else {
+        setCategories(prev => prev.filter(cat => cat.id !== id));
+        setTransactions(prevTrx => prevTrx.map(trx => trx.category_id === id ? {...trx, category_id: null, categories: null} : trx));
+      }
   };
 
   useEffect(() => {
@@ -248,7 +268,7 @@ function App() {
 
   useEffect(() => {
     const fetchTransactions = async () => {
-      if (!hasMore) return;
+      if (!hasMore || loadingMore) return;
       const loader = page === 0 ? setLoading : setLoadingMore;
       loader(true);
       setError(null);
@@ -266,7 +286,11 @@ function App() {
           .range(from, to);
         if (dbError) throw dbError;
         if (data) {
-          setTransactions(prev => [...prev, ...data as any]);
+          setTransactions(prev => {
+            const existingIds = new Set(prev.map(t => t.id));
+            const newUniqueData = (data as Transaction[]).filter(t => !existingIds.has(t.id));
+            return [...prev, ...newUniqueData];
+          });
           setHasMore(data.length === ITEMS_PER_PAGE);
         }
       } catch (err: any) {
@@ -276,7 +300,7 @@ function App() {
       }
     };
     fetchTransactions();
-  }, [page, currentMonth, hasMore]);
+  }, [page, currentMonth]);
   
   useEffect(() => {
       const fetchBudgetAndTotal = async () => {
@@ -304,18 +328,56 @@ function App() {
     const channel = supabase
       .channel('realtime-all')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'tes' }, (payload) => {
-          if (payload.eventType === 'INSERT') showNewTransactionNotification(payload.new);
-          setTransactions([]); setPage(0); setHasMore(true);
-        }
-      )
+          switch (payload.eventType) {
+              case 'INSERT':
+                  const newRecord = payload.new as Transaction;
+                  const newRecordDate = new Date(newRecord.tanggal);
+                  if (newRecordDate.getFullYear() === currentMonth.getFullYear() && newRecordDate.getMonth() === currentMonth.getMonth()) {
+                      showNewTransactionNotification(newRecord);
+                      const newCategory = categories.find(cat => cat.id === newRecord.category_id);
+                      setTransactions(prev => {
+                          const isAlreadyPresent = prev.some(trx => trx.id === newRecord.id);
+                          return isAlreadyPresent ? prev : [{ ...newRecord, categories: newCategory || null }, ...prev];
+                      });
+                  }
+                  break;
+              case 'UPDATE':
+                  const updatedRecord = payload.new as Transaction;
+                  const updatedCategory = categories.find(cat => cat.id === updatedRecord.category_id);
+                  setTransactions(prev => 
+                      prev.map(trx => 
+                          trx.id === updatedRecord.id 
+                              ? { ...trx, ...updatedRecord, categories: updatedCategory || null } 
+                              : trx
+                      )
+                  );
+                  break;
+              case 'DELETE':
+                  setTransactions(prev => prev.filter(trx => trx.id !== payload.old.id));
+                  break;
+              default:
+                  break;
+          }
+      })
       .on('postgres_changes', { event: '*', schema: 'public', table: 'budgets' }, () => {
           const yearMonth = getYearMonthString(currentMonth);
           supabase.from('budgets').select('amount').eq('year_month', yearMonth).single().then(({data}) => setBudget(data?.amount || 0));
       })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'categories' }, () => fetchCategories())
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'categories' }, (payload) => {
+          switch (payload.eventType) {
+            case 'INSERT':
+              setCategories(prev => [...prev, payload.new as Category].sort((a,b) => a.name.localeCompare(b.name)));
+              break;
+            case 'DELETE':
+              setCategories(prev => prev.filter(cat => cat.id !== payload.old.id));
+              break;
+            default:
+              break;
+          }
+      })
       .subscribe();
     return () => { supabase.removeChannel(channel); };
-  }, [currentMonth, notificationPermission]);
+  }, [currentMonth, notificationPermission, categories]);
 
   const formatTanggal = (dateString: string) => new Date(dateString).toLocaleString('id-ID', {
     year: 'numeric', month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit'
@@ -394,7 +456,39 @@ function App() {
 
       <button onClick={() => openModal(setIsTransactionModalOpen)} className="fixed z-30 bottom-6 right-6 bg-theme-gold text-white w-14 h-14 rounded-full flex items-center justify-center shadow-lg hover:opacity-90 transition-all duration-150 active:scale-95" aria-label="Tambah Transaksi Baru"><svg xmlns="http://www.w3.org/2000/svg" className="h-7 w-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" /></svg></button>
 
-      {isTransactionModalOpen && (<div className={`fixed inset-0 flex justify-center items-center z-40 transition-opacity duration-300 ${isTransactionModalVisible ? 'bg-black bg-opacity-70' : 'bg-opacity-0'}`} onClick={closeTransactionModal}><div className={`bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-sm border border-gray-200 dark:border-gray-700 transition-all duration-300 ${isTransactionModalVisible ? 'scale-100 opacity-100' : 'scale-95 opacity-0'}`} onClick={(e) => e.stopPropagation()}><h3 className="text-xl font-semibold mb-4">{editingTransaction ? 'Edit Kategori Transaksi' : 'Tambah Transaksi Baru'}</h3><div className="space-y-4"><div><label className="text-sm text-gray-500 dark:text-gray-400">Nominal</label><input type="text" inputMode="numeric" value={newTransactionNominal} onChange={(e) => handleInputChangeWithFormatting(e.target.value, setNewTransactionNominal)} placeholder="0" className="w-full p-2 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold disabled:bg-gray-200 dark:disabled:bg-gray-700/50 disabled:cursor-not-allowed" disabled={!!editingTransaction} /></div><div><label className="text-sm text-gray-500 dark:text-gray-400">Kategori</label><select value={selectedCategoryId} onChange={(e) => setSelectedCategoryId(e.target.value)} className="w-full p-2 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold"><option value="" disabled>Pilih Kategori</option>{categories.map(cat => <option key={cat.id} value={cat.id}>{cat.name}</option>)}</select></div><div><label className="text-sm text-gray-500 dark:text-gray-400">Catatan (Opsional)</label><input type="text" value={newTransactionDesc} onChange={(e) => setNewTransactionDesc(e.target.value)} placeholder="Contoh: Makan siang di kantor" className="w-full p-2 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold disabled:bg-gray-200 dark:disabled:bg-gray-700/50 disabled:cursor-not-allowed" disabled={!!editingTransaction} /></div></div><div className="flex justify-end gap-4 mt-6"><button onClick={closeTransactionModal} className="bg-gray-200 hover:bg-gray-300 dark:bg-gray-600 dark:hover:bg-gray-700 text-gray-800 dark:text-white font-bold py-2 px-4 rounded-lg transition-transform duration-150 active:scale-95">Batal</button><button onClick={handleSaveTransaction} className="bg-theme-gold hover:opacity-90 text-white font-bold py-2 px-4 rounded-lg transition-transform duration-150 active:scale-95">Simpan</button></div></div></div>)}
+      {isTransactionModalOpen && (<div className={`fixed inset-0 flex justify-center items-center z-40 transition-opacity duration-300 ${isTransactionModalVisible ? 'bg-black bg-opacity-70' : 'bg-opacity-0'}`} onClick={closeTransactionModal}><div className={`bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-sm border border-gray-200 dark:border-gray-700 transition-all duration-300 ${isTransactionModalVisible ? 'scale-100 opacity-100' : 'scale-95 opacity-0'}`} onClick={(e) => e.stopPropagation()}><h3 className="text-xl font-semibold mb-4">{editingTransaction ? 'Edit Kategori Transaksi' : 'Tambah Transaksi Baru'}</h3><div className="space-y-4">
+        
+        {/* --- PERUBAHAN 1: Tampilkan field hanya jika BUKAN mode edit --- */}
+        {!editingTransaction && (
+          <>
+            <div>
+              <label className="text-sm text-gray-500 dark:text-gray-400">Nominal</label>
+              <input type="text" inputMode="numeric" value={newTransactionNominal} onChange={(e) => handleInputChangeWithFormatting(e.target.value, setNewTransactionNominal)} placeholder="0" className="w-full p-2 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold" />
+            </div>
+            <div>
+              <label className="text-sm text-gray-500 dark:text-gray-400">Catatan (Opsional)</label>
+              <input type="text" value={newTransactionDesc} onChange={(e) => setNewTransactionDesc(e.target.value)} placeholder="Contoh: Makan siang di kantor" className="w-full p-2 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold" />
+            </div>
+          </>
+        )}
+        
+        <div>
+          <label className="text-sm text-gray-500 dark:text-gray-400">Kategori</label>
+          {/* --- PERUBAHAN 2: Percantik Dropdown --- */}
+          <div className="relative">
+            <select value={selectedCategoryId} onChange={(e) => setSelectedCategoryId(e.target.value)} className="w-full p-2 pr-10 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold appearance-none cursor-pointer">
+              <option value="" disabled>Pilih Kategori</option>
+              {categories.map(cat => <option key={cat.id} value={cat.id}>{cat.name}</option>)}
+            </select>
+            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-500 dark:text-gray-400">
+              <svg className="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
+                <path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/>
+              </svg>
+            </div>
+          </div>
+        </div>
+
+      </div><div className="flex justify-end gap-4 mt-6"><button onClick={closeTransactionModal} className="bg-gray-200 hover:bg-gray-300 dark:bg-gray-600 dark:hover:bg-gray-700 text-gray-800 dark:text-white font-bold py-2 px-4 rounded-lg transition-transform duration-150 active:scale-95">Batal</button><button onClick={handleSaveTransaction} className="bg-theme-gold hover:opacity-90 text-white font-bold py-2 px-4 rounded-lg transition-transform duration-150 active:scale-95">Simpan</button></div></div></div>)}
       {isBudgetModalOpen && (<div className={`fixed inset-0 flex justify-center items-center z-40 transition-opacity duration-300 ${isBudgetModalVisible ? 'bg-black bg-opacity-70' : 'bg-opacity-0'}`} onClick={closeBudgetModal}><div className={`bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-sm border border-gray-200 dark:border-gray-700 transition-all duration-300 ${isBudgetModalVisible ? 'scale-100 opacity-100' : 'scale-95 opacity-0'}`} onClick={(e) => e.stopPropagation()}><h3 className="text-xl font-semibold mb-4">Atur Budget untuk {new Intl.DateTimeFormat('id-ID', { month: 'long', year: 'numeric' }).format(currentMonth)}</h3><input type="text" inputMode="numeric" value={budgetInput} onChange={(e) => handleInputChangeWithFormatting(e.target.value, setBudgetInput)} placeholder="Masukkan jumlah budget" className="w-full p-2 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold" /><div className="flex justify-end gap-4 mt-4"><button onClick={closeBudgetModal} className="bg-gray-200 hover:bg-gray-300 dark:bg-gray-600 dark:hover:bg-gray-700 text-gray-800 dark:text-white font-bold py-2 px-4 rounded-lg transition-transform duration-150 active:scale-95">Batal</button><button onClick={handleSaveBudget} className="bg-theme-gold hover:opacity-90 text-white font-bold py-2 px-4 rounded-lg transition-transform duration-150 active:scale-95">Simpan</button></div></div></div>)}
       {isNotificationBlockedModalOpen && (<div className={`fixed inset-0 flex justify-center items-center z-40 transition-opacity duration-300 ${isNotificationBlockedModalVisible ? 'bg-black bg-opacity-70' : 'bg-opacity-0'}`} onClick={closeNotificationBlockedModal}><div className={`bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-sm border border-gray-200 dark:border-gray-700 transition-all duration-300 ${isNotificationBlockedModalVisible ? 'scale-100 opacity-100' : 'scale-95 opacity-0'}`} onClick={(e) => e.stopPropagation()}><h3 className="text-xl font-semibold mb-4">Notifikasi Diblokir</h3><p className="text-gray-600 dark:text-gray-300 mb-4">Untuk mengaktifkan notifikasi kembali, Anda harus mengubahnya di pengaturan browser untuk situs ini.</p><p className="text-gray-600 dark:text-gray-300">Cari ikon gembok (🔒) di sebelah alamat situs, klik, lalu ubah izin Notifikasi menjadi "Izinkan".</p><div className="flex justify-end gap-4 mt-6"><button onClick={closeNotificationBlockedModal} className="bg-theme-gold hover:opacity-90 text-white font-bold py-2 px-4 rounded-lg transition-transform duration-150 active:scale-95">Mengerti</button></div></div></div>)}
       {isCategoryModalOpen && (<div className={`fixed inset-0 flex justify-center items-center z-40 transition-opacity duration-300 ${isCategoryModalVisible ? 'bg-black bg-opacity-70' : 'bg-opacity-0'}`} onClick={closeCategoryModal}><div className={`bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-sm border border-gray-200 dark:border-gray-700 transition-all duration-300 ${isCategoryModalVisible ? 'scale-100 opacity-100' : 'scale-95 opacity-0'}`} onClick={(e) => e.stopPropagation()}><h3 className="text-xl font-semibold mb-4">Kelola Kategori</h3><div className="space-y-2 max-h-60 overflow-y-auto mb-4 p-1">{categories.map(cat => (<div key={cat.id} className="flex justify-between items-center bg-gray-100 dark:bg-gray-700 p-2 rounded-lg"><span>{cat.name}</span><button onClick={() => handleDeleteCategory(cat.id)} className="p-1 text-rose-500 hover:text-rose-700"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg></button></div>))}</div><div className="flex gap-2 mt-4"><input type="text" value={newCategoryName} onChange={(e) => setNewCategoryName(e.target.value)} placeholder="Nama kategori baru" className="flex-grow w-full p-2 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold" /><button onClick={handleAddCategory} className="bg-theme-gold text-white p-2 rounded-lg">Tambah</button></div><div className="flex justify-end gap-4 mt-6"><button onClick={closeCategoryModal} className="bg-gray-200 hover:bg-gray-300 dark:bg-gray-600 dark:hover:bg-gray-700 text-gray-800 dark:text-white font-bold py-2 px-4 rounded-lg">Tutup</button></div></div></div>)}
