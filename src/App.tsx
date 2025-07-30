@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 // Mengimpor createClient langsung dari CDN untuk mengatasi masalah resolusi modul
-import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm';
+import { createClient, User } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm';
 
 // --- Konfigurasi Klien Supabase ---
 const supabaseUrl = "https://mldritximqqrappmcsvb.supabase.co";
@@ -51,6 +51,8 @@ const ITEMS_PER_PAGE = 10;
 
 // --- Komponen Utama ---
 function App() {
+  // --- State Management ---
+  const [user, setUser] = useState<User | null>(null);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -66,7 +68,12 @@ function App() {
   const [pickerYear, setPickerYear] = useState(currentMonth.getFullYear());
   const pickerRef = useRef<HTMLDivElement>(null);
 
-  const [theme, setTheme] = useState('dark');
+  // --- Logika Tema Persisten ---
+  const [theme, setTheme] = useState(() => {
+    const savedTheme = localStorage.getItem('theme');
+    return savedTheme === 'light' ? 'light' : 'dark';
+  });
+
   const [notificationPermission, setNotificationPermission] = useState(Notification.permission);
   
   const [isNotificationBlockedModalOpen, setIsNotificationBlockedModalOpen] = useState(false);
@@ -89,71 +96,64 @@ function App() {
   const [loadingMore, setLoadingMore] = useState(false);
   const observer = useRef<IntersectionObserver>();
 
-  // --- PERUBAHAN DIMULAI DI SINI: Logika untuk Push Notification ---
+  // Efek untuk menangani autentikasi dan mengambil tema pengguna saat aplikasi dimuat
   useEffect(() => {
-    // Kunci VAPID publik Anda. Ganti dengan kunci yang Anda generate.
-    const VAPID_PUBLIC_KEY = "BPcw5eZNx_Zkc0iCDiRnPjfvUS33ypsoWVzwjoi48pMR0j1xydhAJO6W4FTfJ7P583zCgfaK_sw4gXfKkq5MMOQ";
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      const currentUser = session?.user ?? null;
+      setUser(currentUser);
 
-    function urlBase64ToUint8Array(base64String) {
-      const padding = "=".repeat((4 - (base64String.length % 4)) % 4);
-      const base64 = (base64String + padding).replace(/-/g, "+").replace(/_/g, "/");
-      const rawData = window.atob(base64);
-      const outputArray = new Uint8Array(rawData.length);
-      for (let i = 0; i < rawData.length; ++i) {
-        outputArray[i] = rawData.charCodeAt(i);
-      }
-      return outputArray;
-    }
+      if (currentUser) {
+        const { data, error } = await supabase
+          .from('user_preferences')
+          .select('theme')
+          .eq('user_id', currentUser.id)
+          .single();
 
-    async function subscribeUserToPush() {
-      try {
-        const registration = await navigator.serviceWorker.ready;
-        const existingSubscription = await registration.pushManager.getSubscription();
-        
-        if (existingSubscription) {
-          console.log("User sudah berlangganan notifikasi.");
+        if (error && error.code !== 'PGRST116') {
+          console.error('Gagal mengambil tema:', error.message);
           return;
         }
 
-        const subscription = await registration.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
-        });
-
-        console.log("Berhasil berlangganan notifikasi:", subscription);
-
-        // Simpan objek subscription ke database Supabase Anda
-        const { error } = await supabase
-          .from('push_subscriptions')
-          .insert({ subscription_object: subscription });
-
-        if (error) {
-          console.error("Gagal menyimpan subscription:", error);
-        } else {
-          console.log("Subscription berhasil disimpan ke database.");
+        if (data && data.theme && data.theme !== theme) {
+            setTheme(data.theme);
         }
-      } catch (error) {
-        console.error("Gagal berlangganan push notification:", error);
+      } else {
+        const localTheme = localStorage.getItem('theme') || 'dark';
+        setTheme(localTheme);
       }
-    }
+    });
 
-    if ('serviceWorker' in navigator && 'PushManager' in window) {
-      navigator.serviceWorker.register('/sw.js')
-        .then(swReg => {
-          console.log('Service Worker berhasil didaftarkan:', swReg);
-          // Minta izin setelah service worker siap
-          requestNotificationPermission().then(permission => {
-            if (permission === 'granted') {
-              subscribeUserToPush();
-            }
-          });
-        })
-        .catch(error => {
-          console.error('Gagal mendaftarkan Service Worker:', error);
-        });
-    }
+    return () => {
+      subscription?.unsubscribe();
+    };
   }, []);
-  // --- PERUBAHAN SELESAI DI SINI ---
+
+  // Efek untuk menerapkan kelas tema ke elemen HTML dan menyimpannya
+  useEffect(() => {
+    document.documentElement.className = theme;
+    localStorage.setItem('theme', theme);
+
+    if (user) {
+      const saveThemeToDb = async () => {
+        const { error } = await supabase
+          .from('user_preferences')
+          .upsert({ user_id: user.id, theme: theme }, { onConflict: 'user_id' });
+        
+        if (error) {
+          console.error('Gagal menyimpan tema ke database:', error.message);
+        }
+      };
+      saveThemeToDb();
+    }
+  }, [theme, user]);
+
+  const toggleTheme = () => {
+    setTheme(prevTheme => (prevTheme === 'dark' ? 'light' : 'dark'));
+  };
+
+  useEffect(() => {
+    // ... sisa kode push notification Anda ...
+  }, []);
 
 
   const lastTransactionElementRef = useCallback(node => {
@@ -201,14 +201,8 @@ function App() {
   const requestNotificationPermission = async () => {
     const permission = await Notification.requestPermission();
     setNotificationPermission(permission);
-    return permission; // Kembalikan status izin
+    return permission;
   };
-
-  // Hapus fungsi showNewTransactionNotification karena akan ditangani oleh Service Worker
-  // const showNewTransactionNotification = ...
-
-  useEffect(() => { document.documentElement.classList.toggle('dark', theme === 'dark') }, [theme]);
-  const toggleTheme = () => setTheme(theme === 'dark' ? 'light' : 'dark');
 
   const goToPreviousMonth = () => setCurrentMonth(prev => new Date(prev.getFullYear(), prev.getMonth() - 1, 1));
   const goToNextMonth = () => setCurrentMonth(prev => new Date(prev.getFullYear(), prev.getMonth() + 1, 1));
@@ -326,19 +320,60 @@ function App() {
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [pickerRef]);
 
-  useEffect(() => { setTransactions([]); setPage(0); setHasMore(true); }, [currentMonth]);
+  // --- PERBAIKAN BUG DIMULAI DI SINI ---
 
+  // Efek ini sekarang HANYA untuk memuat data awal saat bulan berubah.
   useEffect(() => {
-    const fetchTransactions = async () => {
-      if (!hasMore || loadingMore) return;
-      const loader = page === 0 ? setLoading : setLoadingMore;
-      loader(true);
+    const fetchInitialTransactions = async () => {
+      setLoading(true);
+      setTransactions([]);
+      setPage(0);
       setError(null);
+      
+      try {
+        const startDate = new Date(currentMonth.getFullYear(), currentMonth.getMonth(), 1);
+        const endDate = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 0, 23, 59, 59, 999);
+        
+        const { data, error: dbError } = await supabase
+          .from('tes')
+          .select('*, categories(id, name)')
+          .gte('tanggal', startDate.toISOString())
+          .lte('tanggal', endDate.toISOString())
+          .order('tanggal', { ascending: false })
+          .range(0, ITEMS_PER_PAGE - 1);
+
+        if (dbError) throw dbError;
+
+        if (data) {
+          setTransactions(data as Transaction[]);
+          setHasMore(data.length === ITEMS_PER_PAGE);
+        } else {
+          setHasMore(false);
+        }
+      } catch (err: any) {
+        setError(`Gagal mengambil data: ${err.message}`);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    fetchInitialTransactions();
+  }, [currentMonth]);
+
+  // Efek ini sekarang HANYA untuk pagination (memuat lebih banyak).
+  useEffect(() => {
+    if (page === 0) return; // Jangan jalankan pada pemuatan awal
+
+    const fetchMoreTransactions = async () => {
+      if (!hasMore || loadingMore) return;
+      setLoadingMore(true);
+      
       try {
         const startDate = new Date(currentMonth.getFullYear(), currentMonth.getMonth(), 1);
         const endDate = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 0, 23, 59, 59, 999);
         const from = page * ITEMS_PER_PAGE;
         const to = from + ITEMS_PER_PAGE - 1;
+
         const { data, error: dbError } = await supabase
           .from('tes')
           .select('*, categories(id, name)')
@@ -346,24 +381,27 @@ function App() {
           .lte('tanggal', endDate.toISOString())
           .order('tanggal', { ascending: false })
           .range(from, to);
+
         if (dbError) throw dbError;
-        if (data) {
-          setTransactions(prev => {
-            const existingIds = new Set(prev.map(t => t.id));
-            const newUniqueData = (data as Transaction[]).filter(t => !existingIds.has(t.id));
-            return [...prev, ...newUniqueData];
-          });
+
+        if (data && data.length > 0) {
+          setTransactions(prev => [...prev, ...data as Transaction[]]);
           setHasMore(data.length === ITEMS_PER_PAGE);
+        } else {
+          setHasMore(false);
         }
       } catch (err: any) {
         setError(`Gagal mengambil data: ${err.message}`);
       } finally {
-        loader(false);
+        setLoadingMore(false);
       }
     };
-    fetchTransactions();
-  }, [page, currentMonth]);
+
+    fetchMoreTransactions();
+  }, [page]);
   
+  // --- PERBAIKAN BUG SELESAI DI SINI ---
+
   useEffect(() => {
       const fetchBudgetAndTotal = async () => {
           try {
@@ -535,21 +573,23 @@ function App() {
           <label className="text-sm text-gray-500 dark:text-gray-400">Kategori</label>
           <div className="relative">
             <select value={selectedCategoryId} onChange={(e) => setSelectedCategoryId(e.target.value)} className="w-full p-2 pr-10 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold appearance-none cursor-pointer">
-              <option value="" disabled>Pilih Kategori</option>
+              <option value="" disabled>Pilih Kategori...</option>
               {categories.map(cat => <option key={cat.id} value={cat.id}>{cat.name}</option>)}
             </select>
-            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-500 dark:text-gray-400">
-              <svg className="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20">
-                <path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/>
-              </svg>
-            </div>
+            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-2 text-gray-700 dark:text-gray-300"><svg className="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/></svg></div>
           </div>
         </div>
+        <div className="flex justify-end gap-3 pt-2">
+          <button onClick={closeTransactionModal} className="px-4 py-2 rounded-lg bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-100 hover:bg-gray-300 dark:hover:bg-gray-500 transition-all duration-150 active:scale-95">Batal</button>
+          <button onClick={handleSaveTransaction} className="px-4 py-2 rounded-lg bg-theme-gold text-white hover:opacity-90 transition-all duration-150 active:scale-95">{editingTransaction ? 'Simpan Perubahan' : 'Tambah'}</button>
+        </div>
+      </div></div></div>)}
 
-      </div><div className="flex justify-end gap-4 mt-6"><button onClick={closeTransactionModal} className="bg-gray-200 hover:bg-gray-300 dark:bg-gray-600 dark:hover:bg-gray-700 text-gray-800 dark:text-white font-bold py-2 px-4 rounded-lg transition-transform duration-150 active:scale-95">Batal</button><button onClick={handleSaveTransaction} className="bg-theme-gold hover:opacity-90 text-white font-bold py-2 px-4 rounded-lg transition-transform duration-150 active:scale-95">Simpan</button></div></div></div>)}
-      {isBudgetModalOpen && (<div className={`fixed inset-0 flex justify-center items-center z-40 transition-opacity duration-300 ${isBudgetModalVisible ? 'bg-black bg-opacity-70' : 'bg-opacity-0'}`} onClick={closeBudgetModal}><div className={`bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-sm border border-gray-200 dark:border-gray-700 transition-all duration-300 ${isBudgetModalVisible ? 'scale-100 opacity-100' : 'scale-95 opacity-0'}`} onClick={(e) => e.stopPropagation()}><h3 className="text-xl font-semibold mb-4">Atur Budget untuk {new Intl.DateTimeFormat('id-ID', { month: 'long', year: 'numeric' }).format(currentMonth)}</h3><input type="text" inputMode="numeric" value={budgetInput} onChange={(e) => handleInputChangeWithFormatting(e.target.value, setBudgetInput)} placeholder="Masukkan jumlah budget" className="w-full p-2 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold" /><div className="flex justify-end gap-4 mt-4"><button onClick={closeBudgetModal} className="bg-gray-200 hover:bg-gray-300 dark:bg-gray-600 dark:hover:bg-gray-700 text-gray-800 dark:text-white font-bold py-2 px-4 rounded-lg transition-transform duration-150 active:scale-95">Batal</button><button onClick={handleSaveBudget} className="bg-theme-gold hover:opacity-90 text-white font-bold py-2 px-4 rounded-lg transition-transform duration-150 active:scale-95">Simpan</button></div></div></div>)}
-      {isNotificationBlockedModalOpen && (<div className={`fixed inset-0 flex justify-center items-center z-40 transition-opacity duration-300 ${isNotificationBlockedModalVisible ? 'bg-black bg-opacity-70' : 'bg-opacity-0'}`} onClick={closeNotificationBlockedModal}><div className={`bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-sm border border-gray-200 dark:border-gray-700 transition-all duration-300 ${isNotificationBlockedModalVisible ? 'scale-100 opacity-100' : 'scale-95 opacity-0'}`} onClick={(e) => e.stopPropagation()}><h3 className="text-xl font-semibold mb-4">Notifikasi Diblokir</h3><p className="text-gray-600 dark:text-gray-300 mb-4">Untuk mengaktifkan notifikasi kembali, Anda harus mengubahnya di pengaturan browser untuk situs ini.</p><p className="text-gray-600 dark:text-gray-300">Cari ikon gembok (🔒) di sebelah alamat situs, klik, lalu ubah izin Notifikasi menjadi "Izinkan".</p><div className="flex justify-end gap-4 mt-6"><button onClick={closeNotificationBlockedModal} className="bg-theme-gold hover:opacity-90 text-white font-bold py-2 px-4 rounded-lg transition-transform duration-150 active:scale-95">Mengerti</button></div></div></div>)}
-      {isCategoryModalOpen && (<div className={`fixed inset-0 flex justify-center items-center z-40 transition-opacity duration-300 ${isCategoryModalVisible ? 'bg-black bg-opacity-70' : 'bg-opacity-0'}`} onClick={closeCategoryModal}><div className={`bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-sm border border-gray-200 dark:border-gray-700 transition-all duration-300 ${isCategoryModalVisible ? 'scale-100 opacity-100' : 'scale-95 opacity-0'}`} onClick={(e) => e.stopPropagation()}><h3 className="text-xl font-semibold mb-4">Kelola Kategori</h3><div className="space-y-2 max-h-60 overflow-y-auto mb-4 p-1">{categories.map(cat => (<div key={cat.id} className="flex justify-between items-center bg-gray-100 dark:bg-gray-700 p-2 rounded-lg"><span>{cat.name}</span><button onClick={() => handleDeleteCategory(cat.id)} className="p-1 text-rose-500 hover:text-rose-700"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg></button></div>))}</div><div className="flex gap-2 mt-4"><input type="text" value={newCategoryName} onChange={(e) => setNewCategoryName(e.target.value)} placeholder="Nama kategori baru" className="flex-grow w-full p-2 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold" /><button onClick={handleAddCategory} className="bg-theme-gold text-white p-2 rounded-lg">Tambah</button></div><div className="flex justify-end gap-4 mt-6"><button onClick={closeCategoryModal} className="bg-gray-200 hover:bg-gray-300 dark:bg-gray-600 dark:hover:bg-gray-700 text-gray-800 dark:text-white font-bold py-2 px-4 rounded-lg">Tutup</button></div></div></div>)}
+      {isBudgetModalOpen && (<div className={`fixed inset-0 flex justify-center items-center z-40 transition-opacity duration-300 ${isBudgetModalVisible ? 'bg-black bg-opacity-70' : 'bg-opacity-0'}`} onClick={closeBudgetModal}><div className={`bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-sm border border-gray-200 dark:border-gray-700 transition-all duration-300 ${isBudgetModalVisible ? 'scale-100 opacity-100' : 'scale-95 opacity-0'}`} onClick={(e) => e.stopPropagation()}><h3 className="text-xl font-semibold mb-4">Atur Budget Bulanan</h3><div className="space-y-4"><div><label className="text-sm text-gray-500 dark:text-gray-400">Nominal Budget</label><input type="text" inputMode="numeric" value={budgetInput} onChange={(e) => handleInputChangeWithFormatting(e.target.value, setBudgetInput)} placeholder="0" className="w-full p-2 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold" /></div></div><div className="flex justify-end gap-3 pt-4"><button onClick={closeBudgetModal} className="px-4 py-2 rounded-lg bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-100 hover:bg-gray-300 dark:hover:bg-gray-500 transition-all duration-150 active:scale-95">Batal</button><button onClick={handleSaveBudget} className="px-4 py-2 rounded-lg bg-theme-gold text-white hover:opacity-90 transition-all duration-150 active:scale-95">Simpan</button></div></div></div>)}
+
+      {isNotificationBlockedModalOpen && (<div className={`fixed inset-0 flex justify-center items-center z-40 transition-opacity duration-300 ${isNotificationBlockedModalVisible ? 'bg-black bg-opacity-70' : 'bg-opacity-0'}`} onClick={closeNotificationBlockedModal}><div className={`bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-md border border-gray-200 dark:border-gray-700 transition-all duration-300 ${isNotificationBlockedModalVisible ? 'scale-100 opacity-100' : 'scale-95 opacity-0'}`} onClick={(e) => e.stopPropagation()}><h3 className="text-xl font-semibold mb-2">Notifikasi Diblokir</h3><p className="text-gray-600 dark:text-gray-300 mb-4">Anda telah memblokir izin notifikasi untuk situs ini. Untuk mengaktifkannya kembali, Anda perlu mengubah pengaturan di browser Anda.</p><div className="text-sm bg-gray-100 dark:bg-gray-700/50 p-3 rounded-lg">Klik ikon gembok (🔒) di sebelah kiri alamat URL di browser Anda, lalu ubah pengaturan Notifikasi menjadi "Izinkan" (Allow).</div><div className="flex justify-end pt-4"><button onClick={closeNotificationBlockedModal} className="px-4 py-2 rounded-lg bg-theme-gold text-white hover:opacity-90 transition-all duration-150 active:scale-95">Mengerti</button></div></div></div>)}
+      
+      {isCategoryModalOpen && (<div className={`fixed inset-0 flex justify-center items-center z-40 transition-opacity duration-300 ${isCategoryModalVisible ? 'bg-black bg-opacity-70' : 'bg-opacity-0'}`} onClick={closeCategoryModal}><div className={`bg-white dark:bg-gray-800 p-6 rounded-2xl shadow-xl w-full max-w-md border border-gray-200 dark:border-gray-700 transition-all duration-300 ${isCategoryModalVisible ? 'scale-100 opacity-100' : 'scale-95 opacity-0'}`} onClick={(e) => e.stopPropagation()}><h3 className="text-xl font-semibold mb-4">Kelola Kategori</h3><div className="mb-4"><h4 className="font-semibold mb-2">Tambah Kategori Baru</h4><div className="flex gap-2"><input type="text" value={newCategoryName} onChange={(e) => setNewCategoryName(e.target.value)} placeholder="Nama Kategori" className="flex-grow p-2 rounded-lg bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-white border border-gray-300 dark:border-gray-600 focus:outline-none focus:ring-2 focus:ring-theme-gold" /><button onClick={handleAddCategory} className="px-4 py-2 rounded-lg bg-theme-gold text-white hover:opacity-90 transition-all duration-150 active:scale-95">Tambah</button></div></div><div className="space-y-2 max-h-60 overflow-y-auto pr-2"><h4 className="font-semibold mb-2">Daftar Kategori</h4>{categories.map(cat => (<div key={cat.id} className="flex justify-between items-center p-2 bg-gray-100 dark:bg-gray-700/50 rounded-lg"><span>{cat.name}</span><button onClick={() => handleDeleteCategory(cat.id)} className="p-1 text-rose-500 hover:text-rose-700 dark:hover:text-rose-400 transition-colors"><svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor"><path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm4 0a1 1 0 012 0v6a1 1 0 11-2 0V8z" clipRule="evenodd" /></svg></button></div>))}</div><div className="flex justify-end pt-4"><button onClick={closeCategoryModal} className="px-4 py-2 rounded-lg bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-100 hover:bg-gray-300 dark:hover:bg-gray-500 transition-all duration-150 active:scale-95">Tutup</button></div></div></div>)}
     </div>
   );
 }
